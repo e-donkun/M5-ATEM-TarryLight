@@ -55,9 +55,13 @@ IP アドレスが表示されたあとタリー表示に切り替わります�
   - 情報表示モードでは、IP アドレス・MAC アドレス・バッテリー残量を表示します
 - **ボタン B を 2 秒以上長押し**: 画面に `ReConncet` を表示します
 - 
-## ライセンス
+## License
 
-MIT License. 
-Copyright (c) Jun SUZUKI
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE) for details.
+
+Copyright (C) 2020 Jun SUZUKI
 Copyright (c) Jun SUZUKI
 
