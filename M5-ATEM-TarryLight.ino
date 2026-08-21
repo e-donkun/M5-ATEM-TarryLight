@@ -43,7 +43,11 @@ static const uint8_t kAtemSerialOutput = 0;
 static const uint32_t kWiFiConnectTimeout = 15000;
 static const uint32_t kWiFiRetryInterval = 10000;
 static const uint32_t kInfoRefreshInterval = 500;
-static const uint32_t kReconnectHoldTime = 2000;
+static const uint32_t kLongPressTime = 2000;
+
+// Demo mode walks through the tally states so the light can be shown off
+// without a switcher. This is how long each state stays on screen.
+static const uint32_t kDemoStepInterval = 2000;
 
 // Colours in RGB565, defined here so the sketch does not depend on the colour
 // macros of whichever display library version happens to be installed.
@@ -91,13 +95,23 @@ enum Screen : uint8_t {
 
 ATEMstd AtemSwitcher;
 
+// The states demo mode cycles through, in order.
+static const TallyState kDemoSequence[] = {kTallyIdle, kTallyPreview, kTallyProgram};
+static const uint8_t kDemoSequenceLength =
+    sizeof(kDemoSequence) / sizeof(kDemoSequence[0]);
+
 static uint8_t cameraNumber = 1;
 static Screen currentScreen = kScreenNone;
 static TallyState currentTally = kTallyIdle;
 static bool infoMode = false;
+static bool demoMode = false;
 
 static uint32_t lastWiFiAttempt = 0;
 static uint32_t lastInfoRefresh = 0;
+static uint32_t demoSteppedAt = 0;
+static uint8_t demoStep = 0;
+static uint32_t btnAPressedAt = 0;
+static bool btnALongPressDone = false;
 static uint32_t btnBPressedAt = 0;
 static bool btnBLongPressDone = false;
 
@@ -125,6 +139,11 @@ static void drawTally(TallyState state) {
   M5.Lcd.fillScreen(background);
   M5.Lcd.setTextColor(label, background);
   M5.Lcd.drawString(String(cameraNumber), 15, 40, 8);
+
+  // The colours are the real ones, so say when they are being faked.
+  if (demoMode) {
+    M5.Lcd.drawString("DEMO", 18, 135, 2);
+  }
 }
 
 static void drawTextScreen(const char *title, const String &detail) {
@@ -178,6 +197,23 @@ static void showTally(TallyState state) {
   drawTally(state);
 }
 
+static TallyState demoTally() {
+  const uint32_t now = millis();
+  if (now - demoSteppedAt >= kDemoStepInterval) {
+    demoSteppedAt = now;
+    demoStep = (demoStep + 1) % kDemoSequenceLength;
+  }
+  return kDemoSequence[demoStep];
+}
+
+static void setDemoMode(bool enabled) {
+  demoMode = enabled;
+  demoStep = 0;
+  demoSteppedAt = millis();
+  infoMode = false;
+  currentScreen = kScreenNone;
+}
+
 static void showTextScreen(Screen screen, const char *title, const String &detail) {
   if (currentScreen == screen) {
     return;
@@ -204,8 +240,9 @@ static void showInfo() {
   // The fields are padded so that a shorter value overwrites a longer one.
   M5.Lcd.setTextColor(kColorText, kColorTextBg);
   M5.Lcd.setCursor(1, 1);
-  M5.Lcd.printf("Cam %d   ATEM %s\n", cameraNumber,
-                AtemSwitcher.isConnected() ? "up  " : "down");
+  const char *link = demoMode ? "DEMO"
+                              : (AtemSwitcher.isConnected() ? "ATEM up" : "ATEM down");
+  M5.Lcd.printf("Cam %d   %-9s\n", cameraNumber, link);
   M5.Lcd.printf("IP  %-15s\n", WiFi.localIP().toString().c_str());
   M5.Lcd.printf("MAC %s\n", WiFi.macAddress().c_str());
   M5.Lcd.printf("Bat %3d%%\n", batteryPercent());
@@ -273,8 +310,19 @@ static void reconnect() {
 // ---------------------------------------------------------------------------
 
 static void handleButtons() {
-  // BtnA: select the next camera.
+  // BtnA: short press selects the next camera, holding it starts or stops
+  // demo mode. As with BtnB the short press is acted on when released, so
+  // that a hold does not also step the camera.
   if (M5.BtnA.wasPressed()) {
+    btnAPressedAt = millis();
+    btnALongPressDone = false;
+  }
+  if (M5.BtnA.isPressed() && !btnALongPressDone &&
+      millis() - btnAPressedAt >= kLongPressTime) {
+    btnALongPressDone = true;
+    setDemoMode(!demoMode);
+  }
+  if (M5.BtnA.wasReleased() && !btnALongPressDone) {
     cameraNumber = (cameraNumber % kCameraCount) + 1;
     currentScreen = kScreenNone;  // redraw with the new number
   }
@@ -286,7 +334,7 @@ static void handleButtons() {
     btnBLongPressDone = false;
   }
   if (M5.BtnB.isPressed() && !btnBLongPressDone &&
-      millis() - btnBPressedAt >= kReconnectHoldTime) {
+      millis() - btnBPressedAt >= kLongPressTime) {
     btnBLongPressDone = true;
     reconnect();
   }
@@ -299,6 +347,10 @@ static void handleButtons() {
 static void updateDisplay() {
   if (infoMode) {
     showInfo();
+  } else if (demoMode) {
+    // Deliberately ahead of the connection checks: demo mode is meant to work
+    // with no network and no switcher around.
+    showTally(demoTally());
   } else if (WiFi.status() != WL_CONNECTED) {
     // Not the same as "camera not selected", so it gets its own screen
     // instead of the white idle tally.
