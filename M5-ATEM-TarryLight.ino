@@ -22,223 +22,327 @@
 #include <ATEMbase.h>
 #include <ATEMstd.h>
 
+#include "arduino_secrets.h"
 
-IPAddress switcherIp(192, 168, 24, 210);       // IP address of the ATEM switcher
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+// IP address of the ATEM switcher.
+static const IPAddress kSwitcherIp(192, 168, 24, 210);
+
+// Camera inputs to cycle through with the front button. ATEM Mini and
+// Mini Pro have four; raise this for a switcher with more inputs.
+static const uint8_t kCameraCount = 4;
+
+// Verbosity of the ATEM library on the serial port. 0x80 is verbose.
+static const uint8_t kAtemSerialOutput = 0;
+
+// Timings, in milliseconds.
+static const uint32_t kWiFiConnectTimeout = 15000;
+static const uint32_t kWiFiRetryInterval = 10000;
+static const uint32_t kInfoRefreshInterval = 500;
+static const uint32_t kReconnectHoldTime = 2000;
+
+// Colours in RGB565, defined here so the sketch does not depend on the colour
+// macros of whichever display library version happens to be installed.
+// http://www.barth-dev.de/online/rgb565-color-picker/
+static const uint16_t kColorProgram = 0xF800;     // 255   0   0
+static const uint16_t kColorPreview = 0x07E0;     //   0 255   0
+static const uint16_t kColorIdle = 0xFFFF;        // 255 255 255
+static const uint16_t kColorTallyLabel = 0x0000;  //   0   0   0
+static const uint16_t kColorIdleLabel = 0x0020;   //   8   8   8
+static const uint16_t kColorTextBg = 0x0000;
+static const uint16_t kColorText = 0xFFFF;
+
+// The internal red LED of the M5StickC is active low.
+static const uint8_t kLedPin = 10;
+static const uint8_t kLedOn = LOW;
+static const uint8_t kLedOff = HIGH;
+
+// The tally label is drawn in portrait, text screens in landscape.
+static const uint8_t kRotationTally = 0;
+static const uint8_t kRotationText = 3;  // BtnB is on top.
+
+static const char *const kWiFiSsid = SECRET_SSID;
+static const char *const kWiFiPassword = SECRET_PASS;
+
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+enum TallyState : uint8_t {
+  kTallyIdle,
+  kTallyPreview,
+  kTallyProgram,
+};
+
+// What is currently on the screen. kScreenNone forces the next update to
+// redraw, which is also how the very first frame gets drawn.
+enum Screen : uint8_t {
+  kScreenNone,
+  kScreenTally,
+  kScreenNoWiFi,
+  kScreenNoAtem,
+  kScreenInfo,
+};
+
 ATEMstd AtemSwitcher;
 
+static uint8_t cameraNumber = 1;
+static Screen currentScreen = kScreenNone;
+static TallyState currentTally = kTallyIdle;
+static bool infoMode = false;
 
-// http://www.barth-dev.de/online/rgb565-color-picker/
-#define GRAY  0x0020 //   8  8  8
-//#define GREEN 0x0200 //   0 64  0
-#define RED   0xF800 // 255  0  0
-
-
-#define BTN_A_PIN 37
-#define BTN_B_PIN 39
-#define LED_PIN   10
-
-
-#define LED_ON  LOW
-#define LED_OFF HIGH
+static uint32_t lastWiFiAttempt = 0;
+static uint32_t lastInfoRefresh = 0;
+static uint32_t btnBPressedAt = 0;
+static bool btnBLongPressDone = false;
 
 
-const char* ssid = "APSSID";
-const char* password =  "**password**";
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+
+static void drawTally(TallyState state) {
+  uint16_t background = kColorIdle;
+  uint16_t label = kColorIdleLabel;
+  uint8_t led = kLedOff;
+
+  if (state == kTallyProgram) {
+    background = kColorProgram;
+    label = kColorTallyLabel;
+    led = kLedOn;
+  } else if (state == kTallyPreview) {
+    background = kColorPreview;
+    label = kColorTallyLabel;
+  }
+
+  digitalWrite(kLedPin, led);
+  M5.Lcd.setRotation(kRotationTally);
+  M5.Lcd.fillScreen(background);
+  M5.Lcd.setTextColor(label, background);
+  M5.Lcd.drawString(String(cameraNumber), 15, 40, 8);
+}
+
+static void drawTextScreen(const char *title, const String &detail) {
+  digitalWrite(kLedPin, kLedOff);
+  M5.Lcd.setRotation(kRotationText);
+  M5.Lcd.fillScreen(kColorTextBg);
+  M5.Lcd.setTextColor(kColorText, kColorTextBg);
+  M5.Lcd.setCursor(1, 1);
+  M5.Lcd.println(title);
+  M5.Lcd.println(detail);
+  M5.Lcd.printf("Cam %d", cameraNumber);
+}
+
+static uint8_t batteryPercent() {
+  // Rough linear estimate over the usable range of the cell. The AXP192
+  // reports the battery voltage in units of 1.1 mV.
+  const float volts = M5.Axp.GetVbatData() * 1.1f / 1000.0f;
+  float percent = (volts - 3.2f) / (4.15f - 3.2f) * 100.0f;
+
+  if (percent > 100.0f) {
+    percent = 100.0f;
+  } else if (percent < 0.0f) {
+    percent = 0.0f;
+  }
+  return (uint8_t)percent;
+}
 
 
-int cameraNumber = 1;
+// ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
 
-int last_value = 0;
-int cur_value = 0;
+static TallyState readTally() {
+  // Program wins over preview: on a cut both flags can be set for the same
+  // input, and in that case the camera is on air.
+  if (AtemSwitcher.getProgramTally(cameraNumber)) {
+    return kTallyProgram;
+  }
+  if (AtemSwitcher.getPreviewTally(cameraNumber)) {
+    return kTallyPreview;
+  }
+  return kTallyIdle;
+}
+
+static void showTally(TallyState state) {
+  if (currentScreen == kScreenTally && currentTally == state) {
+    return;
+  }
+  currentScreen = kScreenTally;
+  currentTally = state;
+  drawTally(state);
+}
+
+static void showTextScreen(Screen screen, const char *title, const String &detail) {
+  if (currentScreen == screen) {
+    return;
+  }
+  currentScreen = screen;
+  drawTextScreen(title, detail);
+}
+
+static void showInfo() {
+  const uint32_t now = millis();
+
+  if (currentScreen != kScreenInfo) {
+    currentScreen = kScreenInfo;
+    digitalWrite(kLedPin, kLedOff);
+    M5.Lcd.setRotation(kRotationText);
+    M5.Lcd.fillScreen(kColorTextBg);
+    lastInfoRefresh = now - kInfoRefreshInterval;  // draw right away
+  }
+  if (now - lastInfoRefresh < kInfoRefreshInterval) {
+    return;
+  }
+  lastInfoRefresh = now;
+
+  // The fields are padded so that a shorter value overwrites a longer one.
+  M5.Lcd.setTextColor(kColorText, kColorTextBg);
+  M5.Lcd.setCursor(1, 1);
+  M5.Lcd.printf("Cam %d   ATEM %s\n", cameraNumber,
+                AtemSwitcher.isConnected() ? "up  " : "down");
+  M5.Lcd.printf("IP  %-15s\n", WiFi.localIP().toString().c_str());
+  M5.Lcd.printf("MAC %s\n", WiFi.macAddress().c_str());
+  M5.Lcd.printf("Bat %3d%%\n", batteryPercent());
+}
 
 
-int PreviewTallyPrevious = 1;
-int ProgramTallyPrevious = 1;
+// ---------------------------------------------------------------------------
+// Connections
+// ---------------------------------------------------------------------------
+
+static bool connectWiFi() {
+  M5.Lcd.setRotation(kRotationText);
+  M5.Lcd.fillScreen(kColorTextBg);
+  M5.Lcd.setTextColor(kColorText, kColorTextBg);
+  M5.Lcd.setCursor(1, 1);
+  M5.Lcd.println("Connecting to");
+  M5.Lcd.println(kWiFiSsid);
+  Serial.printf("Connecting to %s\n", kWiFiSsid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // modem sleep adds latency to the tally updates
+  WiFi.begin(kWiFiSsid, kWiFiPassword);
+
+  const uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < kWiFiConnectTimeout) {
+    delay(250);
+    M5.Lcd.print(".");
+    Serial.print(".");
+  }
+  Serial.println();
+
+  lastWiFiAttempt = millis();
+  currentScreen = kScreenNone;
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - lastWiFiAttempt < kWiFiRetryInterval) {
+    return;
+  }
+  lastWiFiAttempt = now;
+
+  Serial.println("WiFi lost, retrying");
+  WiFi.disconnect();
+  WiFi.begin(kWiFiSsid, kWiFiPassword);
+}
+
+static void reconnect() {
+  drawTextScreen("Reconnecting", kWiFiSsid);
+  currentScreen = kScreenNone;
+
+  WiFi.disconnect();
+  connectWiFi();
+  AtemSwitcher.connect();
+}
 
 
-int connect_cnt = 0;
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+static void handleButtons() {
+  // BtnA: select the next camera.
+  if (M5.BtnA.wasPressed()) {
+    cameraNumber = (cameraNumber % kCameraCount) + 1;
+    currentScreen = kScreenNone;  // redraw with the new number
+  }
+
+  // BtnB: short press toggles the info screen, holding it reconnects. The
+  // press is acted on when released so that a hold does not do both.
+  if (M5.BtnB.wasPressed()) {
+    btnBPressedAt = millis();
+    btnBLongPressDone = false;
+  }
+  if (M5.BtnB.isPressed() && !btnBLongPressDone &&
+      millis() - btnBPressedAt >= kReconnectHoldTime) {
+    btnBLongPressDone = true;
+    reconnect();
+  }
+  if (M5.BtnB.wasReleased() && !btnBLongPressDone) {
+    infoMode = !infoMode;
+    currentScreen = kScreenNone;
+  }
+}
+
+static void updateDisplay() {
+  if (infoMode) {
+    showInfo();
+  } else if (WiFi.status() != WL_CONNECTED) {
+    // Not the same as "camera not selected", so it gets its own screen
+    // instead of the white idle tally.
+    showTextScreen(kScreenNoWiFi, "No WiFi", WiFi.macAddress());
+  } else if (!AtemSwitcher.isConnected()) {
+    showTextScreen(kScreenNoAtem, "No ATEM", kSwitcherIp.toString());
+  } else {
+    showTally(readTally());
+  }
+}
 
 
-double vbat = 0.0;
-int8_t bat_charge_p = 0;
-
-
-int disp_mode = 0;
-
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
 
 void setup() {
-
-
   Serial.begin(115200);
 
-
-  // initialize the M5StickC object
   M5.begin();
   delay(10);
-  
-  Serial.println();
-  Serial.println();
-  M5.Lcd.setRotation(3); // BtnB is on top.
 
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, kLedOff);
 
-  Serial.print("Connecting to ");
-  M5.Lcd.println("Connecting to ");
-  M5.Lcd.println(ssid);
-  Serial.println(ssid);
-  
-  WiFi.begin(ssid, password);
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.println(".");
-    M5.Lcd.print(".");  
-    connect_cnt++;
+  connectWiFi();
 
-
-    if(connect_cnt>30){
-      break;
-    }
-  }
-
-
-  delay(10);
-  if(WiFi.status() == WL_CONNECTED) { 
-    M5.Lcd.println("");
-    M5.Lcd.println("ATEM Mini Pro Tarry");
-    M5.Lcd.print("IPAddr:");
-    M5.Lcd.println(WiFi.localIP());
-  } else {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(1, 1);
-    M5.Lcd.println("Connection Failed.");  
-    M5.Lcd.print("macAddr:");
-    M5.Lcd.print(WiFi.macAddress());
-    
-  }
-
-
-  pinMode(BTN_A_PIN, INPUT_PULLUP);
-  pinMode(BTN_B_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN,   OUTPUT);
-  digitalWrite(LED_PIN, LED_OFF);
-   
-  delay(60);
-  AtemSwitcher.begin(switcherIp);
-  AtemSwitcher.serialOutput(0x80);
+  AtemSwitcher.begin(kSwitcherIp);
+  AtemSwitcher.serialOutput(kAtemSerialOutput);
   AtemSwitcher.connect();
-
-
 }
-
-
-
-
-void show_info(){
-
-
-    M5.Lcd.setRotation(3); 
-    M5.Lcd.setTextColor(WHITE, BLACK);
-    M5.Lcd.setCursor(1, 1);
-    M5.Lcd.println("ATEM Mini Pro Tarry");
-    M5.Lcd.print("IPAddr:");
-    M5.Lcd.println(WiFi.localIP());
-    M5.Lcd.print("macAddr:");
-    M5.Lcd.println(WiFi.macAddress());
-    
-    vbat = M5.Axp.GetVbatData() * 1.1 / 1000;
-    bat_charge_p = int8_t((vbat - 3.0) / 1.2 * 100);
-    if(bat_charge_p > 100){
-      bat_charge_p = 100;
-    }else if(bat_charge_p < 0){
-      bat_charge_p = 0;
-    }
-    M5.Lcd.printf("Charge: %3d%%", bat_charge_p); 
-
-
-
-
-  
-}
-
-
-
 
 void loop() {
-
-
   M5.update();
+  handleButtons();
+  maintainWiFi();
 
-
-  if(M5.BtnA.wasPressed()){
-    if(disp_mode == 0){
-      cameraNumber++;
-      if(cameraNumber>4) cameraNumber = 1;
-      drawLabel(WHITE, GRAY, LED_OFF);
-    }
+  // runLoop() answers the switcher, keeps the session alive and reconnects on
+  // its own once the link has been quiet for five seconds, so it wants to be
+  // called as often as possible.
+  if (WiFi.status() == WL_CONNECTED) {
+    AtemSwitcher.runLoop();
   }
 
-
-  if(M5.BtnB.wasPressed()){
-    if(disp_mode == 0){
-      disp_mode=1;
-      M5.Lcd.fillScreen(BLACK);
-    } else {
-      disp_mode=0;
-      PreviewTallyPrevious = 1;
-      ProgramTallyPrevious = 1;
-      drawLabel(WHITE, GRAY, LED_OFF);
-    }
-  }
-  if(disp_mode == 1 ){
-      show_info();   
-  }
-
-
-  if(M5.BtnB.pressedFor(2000)){
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(1, 1);
-    M5.Lcd.println("ReConncet");
-       
-  }
-
-
-  // Check for packets, respond to them etc. Keeping the connection alive!
-
-
-  AtemSwitcher.runLoop();
-
-
-  int ProgramTally = AtemSwitcher.getProgramTally(cameraNumber);
-  int PreviewTally = AtemSwitcher.getPreviewTally(cameraNumber);
-
-
-  if ((ProgramTallyPrevious != ProgramTally) || (PreviewTallyPrevious != PreviewTally)) { // changed?
-
-
-    if ((ProgramTally && !PreviewTally) || (ProgramTally && PreviewTally) ) { // only program, or program AND preview
-      drawLabel(RED, BLACK, LOW);
-    } else if (PreviewTally && !ProgramTally) { // only preview
-      drawLabel(GREEN, BLACK, HIGH);
-    } else if (!PreviewTally || !ProgramTally) { // neither
-      drawLabel(WHITE, GRAY, HIGH);
-    }
-
-
-  }
-
-
-  ProgramTallyPrevious = ProgramTally;
-  PreviewTallyPrevious = PreviewTally;
-
-
-  delay(100);
-}
-
-
-void drawLabel(unsigned long int screenColor, unsigned long int labelColor, bool ledValue) {
-  M5.Lcd.setRotation(0);
-  digitalWrite(LED_PIN, ledValue);
-  M5.Lcd.fillScreen(screenColor);
-  M5.Lcd.setTextColor(labelColor, screenColor);
-  M5.Lcd.drawString(String(cameraNumber), 15, 40, 8);
+  updateDisplay();
+  delay(1);
 }
