@@ -62,6 +62,5 @@ the terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
 version. See [LICENSE](LICENSE) for details.
 
-Copyright (C) 2020 Jun SUZUKI
-Copyright (c) Jun SUZUKI
+Copyright (c) 2020 Jun SUZUKI
 
